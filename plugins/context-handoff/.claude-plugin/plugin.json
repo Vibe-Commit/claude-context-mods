@@ -1,0 +1,31 @@
+{
+  "name": "context-handoff",
+  "version": "0.1.0",
+  "description": "In the 60-70% context band, Claude writes a handoff, the handoff is rewound away, the session compacts, and Claude resumes from the file.",
+  "author": {
+    "name": "Vibe-Commit"
+  },
+  "repository": "https://github.com/Vibe-Commit/claude-context-mods",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "bandLow": {
+      "type": "number",
+      "title": "Band start (%)",
+      "description": "Context percent at which Claude is told to hand off at the next natural boundary.",
+      "default": 60
+    },
+    "bandHigh": {
+      "type": "number",
+      "title": "Band end (%)",
+      "description": "Context percent at which Claude is told to hand off now.",
+      "default": 70
+    },
+    "overshoot": {
+      "type": "number",
+      "title": "Overshoot (%)",
+      "description": "Context percent at which a finished turn with no handoff gets a prompt asking for one.",
+      "default": 75
+    }
+  }
+}

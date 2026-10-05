@@ -1,0 +1,23 @@
+{
+  "name": "claude-context-mods",
+  "owner": {
+    "name": "Vibe-Commit"
+  },
+  "metadata": {
+    "description": "Claude Code mods for managing the context window: a usage meter and an automatic handoff-and-compact cycle."
+  },
+  "plugins": [
+    {
+      "name": "context-meter",
+      "source": "./plugins/context-meter",
+      "description": "Shows context-window usage in the prompt footer",
+      "version": "0.2.1"
+    },
+    {
+      "name": "context-handoff",
+      "source": "./plugins/context-handoff",
+      "description": "In the 60-70% context band, Claude writes a handoff, the handoff is rewound away, the session compacts, and Claude resumes from the file.",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "context-meter",
+  "version": "0.2.1",
+  "description": "Shows context-window usage in the prompt footer",
+  "author": {
+    "name": "Vibe-Commit"
+  },
+  "repository": "https://github.com/Vibe-Commit/claude-context-mods",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
