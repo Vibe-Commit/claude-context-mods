@@ -25,12 +25,13 @@ const TOOL_DESCRIPTION = [
   'Saves a note you resume from after the session compacts.',
   'Call it only when a `[context-handoff]` note asks you to, at a natural boundary, never mid-edit.',
   'In a git repo, first run `git status -sb` and `git log -1 --oneline`, then call it alone in its own message.',
-  '`content` is markdown for a future you with no memory of this session: state, not narrative, under 1,000 words.',
-  'Reference what is on disk by path or commit; copy only what is not. Never include secret values.',
+  '`content` is markdown for a future you with no memory of this session: state, not narrative, under 1,000 words excluding the Pending specs section, which has no cap.',
+  'Reference what is on disk by path or commit; copy what is not. Anything the user said in conversation that is not in a file is not on disk, so copy it. Never include secret values.',
   'Use these sections in order, writing "None" for an empty one:',
   "## Goal (the user's current request in their words, and what done looks like);",
   '## Constraints (every user rule still in force, verbatim);',
   '## Status (each item: verified with a command and result from after its last change, unverified, or not started);',
+  '## Pending specs (verbatim) (for every item not yet done that the user or a plan specified: copy the exact text, including conditions, fail-closed shapes, required tests or witness mutants, and where it wires in, e.g. build sessions vs rewrite attempts, live-only vs testable in dry runs; never reduce an item to a label; write any detail that was never decided as an open question under that item);',
   '## Next action (one step: the file or command, and the expected result);',
   '## Failed approaches (what failed and why, with the exact error);',
   '## Decisions (each choice, what was ruled out, and why);',
@@ -62,7 +63,7 @@ const resumePrompt = (path: string, late: string) =>
   `${RESUME_PREFIX} Read the note at ${path} with the Read tool. ` +
   `Before any edits, run its Verify commands and check git against its Environment section; ` +
   `where they differ, trust the repo and never revert or discard work to match the note. ` +
-  `Follow its Constraints. Then continue from its Next action without waiting for confirmation.` +
+  `Follow its Constraints and treat its Pending specs as binding; if a pending item is only a label with no conditions, tell the user before implementing it and do not guess. Then continue from its Next action without waiting for confirmation.` +
   (late === '' ? '' :
     `\n\nThese messages arrived after the note was written, so it does not cover them. ` +
     `Handle them first if they change the plan:\n${late}`)
@@ -256,7 +257,9 @@ async function compactAndResume($: EngineInterface, attempt: number): Promise<vo
   try {
     compacted = await $.session.compact({
       instructions: 'Summarize the work so far. A handoff note written by the assistant ' +
-        'will be read right after this summary and takes precedence on next steps.',
+        'will be read right after this summary and takes precedence on next steps. ' +
+        'Preserve verbatim any binding specs, exact conditions and per-item requirements ' +
+        'the user gave; never shorten them to labels.',
     })
   } catch (err) {
     // Refused while a turn still runs: try again shortly.

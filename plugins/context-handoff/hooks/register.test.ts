@@ -111,6 +111,8 @@ test('the whole cycle: write, hold, compact, resume, read, delete', async ($, on
   expect(w.compacts).toHaveLength(1)
   expect(w.submitted).toHaveLength(1)
   expect(w.submitted[0]).toContain(PATH)
+  expect(w.compacts[0]?.instructions).toContain('never shorten them to labels')
+  expect(w.submitted[0]).toContain('treat its Pending specs as binding')
 
   w.pct = 20
   await $.tool.call({ tool: 'Read', file_path: '/elsewhere.md' })
