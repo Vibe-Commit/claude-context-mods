@@ -25,7 +25,7 @@ const TOOL_DESCRIPTION = [
   'Saves a note you resume from after the session compacts.',
   'Call it only when a `[context-handoff]` note asks you to, at a natural boundary, never mid-edit.',
   'In a git repo, first run `git status -sb` and `git log -1 --oneline`, then call it alone in its own message.',
-  '`content` is markdown for a future you with no memory of this session: state, not narrative, under 1,000 words excluding the Pending specs section, which has no cap.',
+  '`content` is markdown for a future you with no memory of this session: state, not narrative. Use extremely concise language and minimize text, except in Pending specs, where exact wording matters more than brevity.',
   'Reference what is on disk by path or commit; copy what is not. Anything the user said in conversation that is not in a file is not on disk, so copy it. Never include secret values.',
   'Use these sections in order, writing "None" for an empty one:',
   "## Goal (the user's current request in their words, and what done looks like);",
