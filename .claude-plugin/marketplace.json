@@ -4,20 +4,26 @@
     "name": "Vibe-Commit"
   },
   "metadata": {
-    "description": "Claude Code mods for managing the context window: a usage meter and an automatic handoff-and-compact cycle."
+    "description": "Claude Code mods for long sessions: a context usage meter, an automatic handoff-and-compact cycle, and prompt timestamps."
   },
   "plugins": [
     {
       "name": "context-meter",
       "source": "./plugins/context-meter",
-      "description": "Shows context-window usage in the prompt footer",
-      "version": "0.2.1"
+      "description": "Shows context-window usage and five-hour and weekly limit usage in the prompt footer",
+      "version": "0.3.0"
     },
     {
       "name": "context-handoff",
       "source": "./plugins/context-handoff",
       "description": "In the 60-70% context band, Claude writes a handoff, the handoff is rewound away, the session compacts, and Claude resumes from the file.",
-      "version": "0.1.0"
+      "version": "0.1.3"
+    },
+    {
+      "name": "prompt-timestamp",
+      "source": "./plugins/prompt-timestamp",
+      "description": "Prefixes every prompt you type with the local date and time, visible to you and Claude.",
+      "version": "1.0.0"
     }
   ]
 }

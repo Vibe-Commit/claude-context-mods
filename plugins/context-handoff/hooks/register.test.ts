@@ -42,6 +42,7 @@ function world(on: On, pct: number | undefined): World {
   })
   on('prompt.submit', (_$, e) => { w.submitted.push(e.text); return { text: e.text } })
   on('tool.call', () => ({ result: 'ok' }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   return w
 }
@@ -143,12 +144,31 @@ test('a resume turn that never reads the note keeps it', async ($, on) => {
   await $.turn.complete(turnEnd)
   await clock.settle()
 
+  await $.turn.start({ text: w.submitted[0] ?? '', turnId: 't2' })
   await $.turn.complete({ ...turnEnd, turnId: 't2' })
   expect(w.runs).toHaveLength(0)
   expect(w.files.has(PATH)).toBe(true)
   w.pct = 20
   await $.tool.call({ tool: 'Read', file_path: PATH })
   expect(w.runs).toHaveLength(0)
+})
+
+test("another turn ending during the resume does not end the handoff", async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on, 62)
+  await $.tool.call(bash)
+  await $.tool.call({ tool: TOOL_ID, content: NOTE } as never)
+  await $.turn.complete(turnEnd)
+  await clock.settle()
+
+  // A message from another session runs and ends before the resume turn.
+  await $.turn.start({ text: 'from session B', turnId: 'other' })
+  await $.turn.complete({ ...turnEnd, turnId: 'other' })
+  await $.turn.start({ text: w.submitted[0] ?? '', turnId: 't2' })
+  w.pct = 20
+  await $.tool.call({ tool: 'Read', file_path: PATH })
+  expect(w.runs[0]?.[0]).toBe('rm')
+  expect(w.files.has(PATH)).toBe(false)
 })
 
 test("a subagent's turn end does not compact", async ($, on) => {
@@ -202,8 +222,46 @@ test('the rewind: the summary runs over the transcript before the Handoff call',
   expect(w.submitted[0]).toContain(PATH)
 })
 
+test('a message sent after the Handoff call rides on the resume prompt', async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on, 62)
+  let release = () => {}
+  w.hold = new Promise<void>(r => { release = r })
+  await $.tool.call(bash)
+  await $.tool.call({ tool: TOOL_ID, content: NOTE } as never)
+  await $.turn.complete(turnEnd)
+  await clock.settle()
+  const msg = (role: 'user' | 'assistant', text: string, tools: string[] = []) => ({
+    role, text, toolUses: tools.map((tool, i) => ({ tool_use_id: `${text}-${i}`, tool, input: {} })),
+  })
+  await $.session.compact({
+    trigger: 'plugin',
+    messages: [
+      msg('user', 'build the thing'),
+      msg('assistant', 'handing off', [TOOL_ID]),
+      { ...msg('user', ''), toolResults: [{ tool_use_id: 'x', text: 'saved', isError: false }] },
+      msg('user', 'from session B: use port 4000'),
+      msg('assistant', 'done, compacting'),
+    ],
+  } as never)
+  release()
+  await clock.settle()
+  expect(w.submitted[0]).toContain(PATH)
+  expect(w.submitted[0]).toContain('> from session B: use port 4000')
+  expect(w.submitted[0]).not.toContain('build the thing')
+})
+
 test('a configured band replaces the default', { options: { bandLow: 30, bandHigh: 40, overshoot: 50 } }, async ($, on) => {
   world(on, 35)
   const r = await $.tool.call(bash)
   expect(await contextOf(r as never)).toContain('Context is at 35%')
+})
+
+test('/handoff now submits a prompt so Claude acts without another message', async ($, on) => {
+  const w = world(on, 30)
+  const clock = mock.clock(on)
+  const r = await $.command.run({ command: 'handoff', args: 'now' })
+  expect((r as { text?: string }).text).toContain('Asked Claude to hand off')
+  await clock.settle()
+  expect(w.submitted.join('\n')).toContain('call the Handoff tool now')
 })

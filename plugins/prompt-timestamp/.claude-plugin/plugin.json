@@ -1,0 +1,11 @@
+{
+  "name": "prompt-timestamp",
+  "version": "1.0.0",
+  "description": "Prefixes every prompt you type with the local date and time, visible to you and Claude.",
+  "author": {
+    "name": "Vibe-Commit"
+  },
+  "repository": "https://github.com/Vibe-Commit/claude-context-mods",
+  "license": "MIT",
+  "keywords": ["mod", "hooks", "timestamp", "prompt"]
+}

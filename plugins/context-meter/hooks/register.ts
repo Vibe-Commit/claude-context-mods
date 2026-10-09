@@ -1,5 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type {
+  EngineInterface,
+  Register,
+  SessionContextUsage,
+  SessionRateLimit,
+} from 'claude-code'
 
 import type { Label } from '../types'
 
@@ -15,17 +20,37 @@ function fmt(n: number): string {
   return String(n)
 }
 
+const LIMITS = [
+  { kind: 'five_hour', short: '5h' },
+  { kind: 'seven_day', short: '7d' },
+] as const
+
+function formatContext(context: SessionContextUsage): string {
+  if (context.tokens === undefined || context.percent === undefined) {
+    return `— / ${fmt(context.window)}`
+  }
+
+  return `${fmt(context.tokens)} / ${fmt(context.window)} (${context.percent}%)`
+}
+
+// Only the five-hour and weekly windows; the engine leaves out any it has no reading for.
+function formatLimits(rateLimits: readonly SessionRateLimit[]): string[] {
+  return LIMITS.flatMap(({ kind, short }) => {
+    const limit = rateLimits.find(l => l.kind === kind)
+
+    return limit === undefined ? [] : [`${short} ${Math.round(limit.percentUsed)}%`]
+  })
+}
+
 async function refresh($: EngineInterface): Promise<void> {
   try {
-    const { context } = await $.session.usage()
+    const { context, rateLimits } = await $.session.usage()
+    const text = [formatContext(context), ...formatLimits(rateLimits)].join(' · ')
+    await update($, label, () => text)
 
-    if (context.tokens === undefined || context.percent === undefined) {
-      await update($, label, () => `— / ${fmt(context.window)}`)
+    if (context.percent === undefined) {
       return
     }
-
-    const text = `${fmt(context.tokens)} / ${fmt(context.window)} (${context.percent}%)`
-    await update($, label, () => text)
 
     if (context.percent >= WARN_AT && !isWarned) {
       isWarned = true

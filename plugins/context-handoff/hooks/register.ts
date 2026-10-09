@@ -18,20 +18,25 @@ const firmRef = { plugin: 'context-handoff', key: 'isFirmSent' } as const
 const overshootRef = { plugin: 'context-handoff', key: 'isOvershootSent' } as const
 const disabledRef = { plugin: 'context-handoff', key: 'isDisabled' } as const
 const countRef = { plugin: 'context-handoff', key: 'handoffCount' } as const
+const resumeTurnRef = { plugin: 'context-handoff', key: 'resumeTurnId' } as const
+const lateRef = { plugin: 'context-handoff', key: 'lateMessages' } as const
 
 const TOOL_DESCRIPTION = [
-  'Save a handoff note for yourself, after which the session compacts and you resume from the note.',
-  'Call it only when told your context is in the handoff band, and only at a natural boundary:',
-  'a task finished, tests green, before a new subtask. Never mid-edit. Call it alone, not beside other tools.',
-  '`content` is the whole note in markdown, written for a future you with no memory of this session:',
-  '## Goal (what the user asked for, in their words where it matters);',
-  '## State (what is done, what is verified and how);',
-  '## Decisions (each with its why, and what was ruled out);',
-  '## Files (paths touched or central, one line each);',
-  '## Open problems (bugs, doubts, unverified claims);',
-  '## Next steps (numbered, concrete, the very next action first);',
-  '## Verify (commands that prove the state).',
-  'After it returns, end your turn immediately with a one-line message and no further tool calls.',
+  'Saves a note you resume from after the session compacts.',
+  'Call it only when a `[context-handoff]` note asks you to, at a natural boundary, never mid-edit.',
+  'In a git repo, first run `git status -sb` and `git log -1 --oneline`, then call it alone in its own message.',
+  '`content` is markdown for a future you with no memory of this session: state, not narrative, under 1,000 words.',
+  'Reference what is on disk by path or commit; copy only what is not. Never include secret values.',
+  'Use these sections in order, writing "None" for an empty one:',
+  "## Goal (the user's current request in their words, and what done looks like);",
+  '## Constraints (every user rule still in force, verbatim);',
+  '## Status (each item: verified with a command and result from after its last change, unverified, or not started);',
+  '## Next action (one step: the file or command, and the expected result);',
+  '## Failed approaches (what failed and why, with the exact error);',
+  '## Decisions (each choice, what was ruled out, and why);',
+  '## Open issues (bugs and failing tests with exact errors, questions for the user);',
+  '## Environment (branch, HEAD, uncommitted changes, files changed this session, running processes);',
+  '## Verify (read-only commands, each with its expected result).',
 ].join(' ')
 
 const softNote = (pct: number) =>
@@ -47,9 +52,20 @@ const overshootPrompt = (pct: number) =>
   `Context is at ${pct}%, past the handoff band. Call the ${TOOL} tool now with ` +
   `your handoff note, then end your turn.`
 
-const resumePrompt = (path: string) =>
-  `Resuming after a context handoff. Read ${path} with the Read tool and ` +
-  `continue from its next steps.`
+const nowPrompt =
+  `The user asked for a context handoff. Finish the step in hand, then call the ${TOOL} ` +
+  `tool now with your handoff note and end your turn.`
+
+const RESUME_PREFIX = 'Resuming after a context handoff.'
+
+const resumePrompt = (path: string, late: string) =>
+  `${RESUME_PREFIX} Read the note at ${path} with the Read tool. ` +
+  `Before any edits, run its Verify commands and check git against its Environment section; ` +
+  `where they differ, trust the repo and never revert or discard work to match the note. ` +
+  `Follow its Constraints. Then continue from its Next action without waiting for confirmation.` +
+  (late === '' ? '' :
+    `\n\nThese messages arrived after the note was written, so it does not cover them. ` +
+    `Handle them first if they change the plan:\n${late}`)
 
 type Band = { low: number; high: number; overshoot: number }
 
@@ -100,10 +116,10 @@ export const register: Register = (on, options) => {
       }
       await $.state.set(phaseRef, 'nudged')
       await $.state.set(firmRef, true)
-      return {
-        text: 'Asked Claude to hand off.',
-        context: [`[context-handoff] The user asked for a handoff. Call the ${TOOL} tool now and end your turn.`],
-      }
+      // A command's `context` is only recorded, it starts no turn, so submit
+      // a prompt to make Claude act now.
+      $.clock.after(0, () => void $.prompt.submit({ text: nowPrompt }))
+      return { text: 'Asked Claude to hand off.' }
     }
     const pct = (await $.session.usage()).context.percent
     const isDisabled = (await $.state.get(disabledRef)).value === true
@@ -167,6 +183,15 @@ export const register: Register = (on, options) => {
     return note === undefined ? next(e) : next({ ...e, context: [...(e.context ?? []), note] })
   })
 
+  // Marks which turn is the resume turn, so another turn ending first (a
+  // message from another session, say) is not taken for it.
+  on('turn.start', async ($, e, next) => {
+    if ((await phaseOf($)) === 'resuming' && e.text.startsWith(RESUME_PREFIX)) {
+      await $.state.set(resumeTurnRef, e.turnId)
+    }
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const answered = await next(e)
     if (e.agentId !== undefined) return answered
@@ -186,6 +211,8 @@ export const register: Register = (on, options) => {
     }
 
     if (phase === 'resuming') {
+      // Only the resume turn's end counts; any other turn ends and waits.
+      if ((await $.state.get(resumeTurnRef)).value !== e.turnId) return answered
       // The resume turn ended without a successful Read of the note: keep it.
       const path = (await $.state.get(pathRef)).value
       await finish($, false)
@@ -216,6 +243,7 @@ export const register: Register = (on, options) => {
       $.ui.log('context-handoff: no Handoff call in the transcript; compacting it whole', { to: 'debug' })
       return next(e)
     }
+    await $.state.set(lateRef, lateMessages(e.messages, at))
     return next({ ...e, messages: e.messages.slice(0, at) })
   })
 }
@@ -245,7 +273,8 @@ async function compactAndResume($: EngineInterface, attempt: number): Promise<vo
   }
   await $.state.set(phaseRef, 'resuming')
   $.ui.status('handoff: resuming')
-  await $.prompt.submit({ text: resumePrompt(path) })
+  const late = (await $.state.get(lateRef)).value ?? ''
+  await $.prompt.submit({ text: resumePrompt(path, late) })
 }
 
 // Deletes the note only when the Read was of exactly the file this plugin
@@ -284,6 +313,8 @@ async function finish($: EngineInterface, isDone: boolean): Promise<void> {
   await $.state.set(pathRef, '')
   await $.state.set(firmRef, false)
   await $.state.set(overshootRef, false)
+  await $.state.set(lateRef, '')
+  await $.state.set(resumeTurnRef, '')
   $.ui.status(undefined)
 }
 
@@ -321,6 +352,17 @@ async function handoffDir($: EngineInterface): Promise<string> {
   const home = await $.env.get('HOME')
   if (!home) throw new Error('HOME is not set')
   return `${home}/.claude/handoffs/${await $.session.id()}`
+}
+
+// User text sent after the Handoff call (the rewind drops it from the summary
+// and the note predates it), whether typed or relayed from another session.
+// Tool results are not `text`, and the plugin's own notes are skipped.
+function lateMessages(messages: readonly SessionMessage[], at: number): string {
+  return messages
+    .slice(at + 1)
+    .filter(m => m.role === 'user' && m.text.trim() !== '' && !m.text.startsWith('[context-handoff]'))
+    .map(m => `> ${m.text.trim().replace(/\n/g, '\n> ')}`)
+    .join('\n\n')
 }
 
 function lastHandoffCall(messages: readonly SessionMessage[]): number {

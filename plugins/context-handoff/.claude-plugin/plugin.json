@@ -1,6 +1,6 @@
 {
   "name": "context-handoff",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "In the 60-70% context band, Claude writes a handoff, the handoff is rewound away, the session compacts, and Claude resumes from the file.",
   "author": {
     "name": "Vibe-Commit"

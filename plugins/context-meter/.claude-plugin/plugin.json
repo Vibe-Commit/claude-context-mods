@@ -1,7 +1,7 @@
 {
   "name": "context-meter",
-  "version": "0.2.1",
-  "description": "Shows context-window usage in the prompt footer",
+  "version": "0.3.0",
+  "description": "Shows context-window usage and five-hour and weekly limit usage in the prompt footer",
   "author": {
     "name": "Vibe-Commit"
   },
