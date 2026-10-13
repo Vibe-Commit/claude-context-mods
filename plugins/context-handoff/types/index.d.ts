@@ -9,6 +9,9 @@ declare module 'claude-code' {
       isOvershootSent: boolean
       isDisabled: boolean
       handoffCount: number
+      resumeTurnId: string
+      lateMessages: string
+      compactOutcome: string
     }
   }
 }

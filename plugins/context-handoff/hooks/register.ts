@@ -20,6 +20,7 @@ const disabledRef = { plugin: 'context-handoff', key: 'isDisabled' } as const
 const countRef = { plugin: 'context-handoff', key: 'handoffCount' } as const
 const resumeTurnRef = { plugin: 'context-handoff', key: 'resumeTurnId' } as const
 const lateRef = { plugin: 'context-handoff', key: 'lateMessages' } as const
+const outcomeRef = { plugin: 'context-handoff', key: 'compactOutcome' } as const
 
 const TOOL_DESCRIPTION = [
   'Saves a note you resume from after the session compacts.',
@@ -57,6 +58,12 @@ const nowPrompt =
   `The user asked for a context handoff. Finish the step in hand, then call the ${TOOL} ` +
   `tool now with your handoff note and end your turn.`
 
+const COMPACT_INSTRUCTIONS =
+  'Summarize the work so far. A handoff note written by the assistant ' +
+  'will be read right after this summary and takes precedence on next steps. ' +
+  'Preserve verbatim any binding specs, exact conditions and per-item requirements ' +
+  'the user gave; never shorten them to labels.'
+
 const RESUME_PREFIX = 'Resuming after a context handoff.'
 
 const resumePrompt = (path: string, late: string) =>
@@ -66,7 +73,8 @@ const resumePrompt = (path: string, late: string) =>
   `Follow its Constraints and treat its Pending specs as binding; if a pending item is only a label with no conditions, tell the user before implementing it and do not guess. Then continue from its Next action without waiting for confirmation.` +
   (late === '' ? '' :
     `\n\nThese messages arrived after the note was written, so it does not cover them. ` +
-    `Handle them first if they change the plan:\n${late}`)
+    `Tools were blocked once the note was saved, so none was acted on and no reply was sent. ` +
+    `Handle them first if they change the plan, and send any reply they ask for:\n${late}`)
 
 type Band = { low: number; high: number; overshoot: number }
 
@@ -152,6 +160,9 @@ export const register: Register = (on, options) => {
     const path = `${await handoffDir($)}/handoff-${count + 1}.md`
     await $.fs.write(path, content)
     await $.state.set(pathRef, path)
+    // Each handoff's late window starts at its own call, even after an abort.
+    await $.state.set(lateRef, '')
+    await $.state.set(outcomeRef, '')
     await $.state.set(phaseRef, 'pending')
     $.ui.status('handoff: saved · compacting when this turn ends')
     return {
@@ -234,18 +245,41 @@ export const register: Register = (on, options) => {
     return answered
   })
 
-  // The rewind: what the summary runs over ends before the Handoff call, so
-  // writing the note (and the turn's last words) never reach the summary.
+  // A message that reaches Claude after the Handoff call (another session, a
+  // teammate, a task) is drained into the handoff turn as a delivery row, which
+  // the rewind cuts off. Quote it for the resume prompt; the row is kept as is.
+  on('session.append', async ($, e, next) => {
+    const stored = await next(e)
+    if (e.agentId !== undefined || (e.door !== 'delivery' && e.door !== 'prompt')) return stored
+    if (stored.message === undefined || (await phaseOf($)) !== 'pending') return stored
+    if (e.origin.kind === 'plugin' && 'name' in e.origin && e.origin.name === 'context-handoff') return stored
+    const text = textOf(stored.message.content)
+    if (text === '') return stored
+    const late = (await $.state.get(lateRef)).value ?? ''
+    await $.state.set(lateRef, `${late === '' ? '' : `${late}\n\n`}> ${text.replace(/\n/g, '\n> ')}`)
+    return stored
+  })
+
+  // The rewind: the summary runs over the transcript with the saved Handoff
+  // call cut out, up to the next turn's start, so writing the note (and the
+  // turn's last words) never reach the summary. Our own `$.session.compact` is
+  // skipped as re-entry, so compactAndResume runs `/compact`, which raises this
+  // hook with trigger 'manual'. Records how it ended for compactAndResume.
   on('session.compact', async ($, e, next) => {
-    if (e.agentId !== undefined || e.trigger !== 'plugin') return next(e)
-    if ((await phaseOf($)) !== 'compacting' || !Array.isArray(e.messages)) return next(e)
-    const at = lastHandoffCall(e.messages)
-    if (at <= 0) {
-      $.ui.log('context-handoff: no Handoff call in the transcript; compacting it whole', { to: 'debug' })
-      return next(e)
+    if (e.agentId !== undefined || (e.trigger !== 'manual' && e.trigger !== 'plugin')) return next(e)
+    if ((await phaseOf($)) !== 'compacting') return next(e)
+    const done = async (r: Awaited<ReturnType<typeof next>>) => {
+      await $.state.set(outcomeRef, r.skip === undefined ? 'compacted' : `skipped: ${r.skip}`)
+      return r
     }
-    await $.state.set(lateRef, lateMessages(e.messages, at))
-    return next({ ...e, messages: e.messages.slice(0, at) })
+    const cut = Array.isArray(e.messages) ? handoffCut(e.messages, (await $.state.get(pathRef)).value ?? '') : undefined
+    if (cut === undefined || cut.at <= 0) {
+      if (Array.isArray(e.messages)) {
+        $.ui.log('context-handoff: no saved Handoff call in the transcript; compacting it whole', { to: 'debug' })
+      }
+      return done(await next(e))
+    }
+    return done(await next({ ...e, messages: [...e.messages.slice(0, cut.at), ...e.messages.slice(cut.end)] }))
   })
 }
 
@@ -253,14 +287,8 @@ async function compactAndResume($: EngineInterface, attempt: number): Promise<vo
   const path = (await $.state.get(pathRef)).value
   if (!path) return finish($, false)
   $.ui.status('handoff: compacting')
-  let compacted
   try {
-    compacted = await $.session.compact({
-      instructions: 'Summarize the work so far. A handoff note written by the assistant ' +
-        'will be read right after this summary and takes precedence on next steps. ' +
-        'Preserve verbatim any binding specs, exact conditions and per-item requirements ' +
-        'the user gave; never shorten them to labels.',
-    })
+    await $.command.run({ command: 'compact', args: COMPACT_INSTRUCTIONS })
   } catch (err) {
     // Refused while a turn still runs: try again shortly.
     if (attempt < COMPACT_ATTEMPTS) {
@@ -270,11 +298,13 @@ async function compactAndResume($: EngineInterface, attempt: number): Promise<vo
     $.ui.toast(`Handoff: compaction failed (${String(err)}); the note stays at ${path}.`)
     return finish($, false)
   }
-  if (compacted.skip !== undefined) {
-    $.ui.toast(`Handoff: compaction skipped (${compacted.skip}); the note stays at ${path}.`)
+  // Before the read: this `$` sees the hook's write only after one of its own.
+  await $.state.set(phaseRef, 'resuming')
+  const outcome = (await $.state.get(outcomeRef)).value ?? ''
+  if (outcome !== 'compacted') {
+    $.ui.toast(`Handoff: compaction ${outcome === '' ? 'did not run' : outcome}; the note stays at ${path}.`)
     return finish($, false)
   }
-  await $.state.set(phaseRef, 'resuming')
   $.ui.status('handoff: resuming')
   const late = (await $.state.get(lateRef)).value ?? ''
   await $.prompt.submit({ text: resumePrompt(path, late) })
@@ -317,6 +347,7 @@ async function finish($: EngineInterface, isDone: boolean): Promise<void> {
   await $.state.set(firmRef, false)
   await $.state.set(overshootRef, false)
   await $.state.set(lateRef, '')
+  await $.state.set(outcomeRef, '')
   await $.state.set(resumeTurnRef, '')
   $.ui.status(undefined)
 }
@@ -357,21 +388,24 @@ async function handoffDir($: EngineInterface): Promise<string> {
   return `${home}/.claude/handoffs/${await $.session.id()}`
 }
 
-// User text sent after the Handoff call (the rewind drops it from the summary
-// and the note predates it), whether typed or relayed from another session.
-// Tool results are not `text`, and the plugin's own notes are skipped.
-function lateMessages(messages: readonly SessionMessage[], at: number): string {
-  return messages
-    .slice(at + 1)
-    .filter(m => m.role === 'user' && m.text.trim() !== '' && !m.text.startsWith('[context-handoff]'))
-    .map(m => `> ${m.text.trim().replace(/\n/g, '\n> ')}`)
-    .join('\n\n')
+function textOf(content: readonly { type: string; text?: unknown }[]): string {
+  return content
+    .flatMap(b => (b.type === 'text' && typeof b.text === 'string' ? [b.text] : []))
+    .join('\n')
+    .trim()
 }
 
-function lastHandoffCall(messages: readonly SessionMessage[]): number {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]
-    if (m?.role === 'assistant' && m.toolUses.some(u => u.tool === TOOL_ID)) return i
-  }
-  return -1
+// The cut around the saved Handoff call: from its assistant message to the
+// next turn's first user text, so a turn that ran before the compaction stays.
+// A denied Handoff call has no "saved" result and never moves it.
+function handoffCut(messages: readonly SessionMessage[], path: string): { at: number; end: number } | undefined {
+  if (path === '') return undefined
+  const saved = `Handoff saved to ${path}`
+  const id = messages
+    .flatMap(m => m.toolResults ?? [])
+    .findLast(r => r.text.startsWith(saved))?.tool_use_id
+  const at = id === undefined ? -1 : messages.findIndex(m => m.role === 'assistant' && m.toolUses.some(u => u.tool_use_id === id))
+  if (at < 0) return undefined
+  const next = messages.findIndex((m, i) => i > at && m.role === 'user' && m.text.trim() !== '' && (m.toolResults ?? []).length === 0)
+  return { at, end: next < 0 ? messages.length : next }
 }
