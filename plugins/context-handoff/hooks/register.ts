@@ -248,6 +248,8 @@ export const register: Register = (on, options) => {
   // A message that reaches Claude after the Handoff call (another session, a
   // teammate, a task) is drained into the handoff turn as a delivery row, which
   // the rewind cuts off. Quote it for the resume prompt; the row is kept as is.
+  // The quote keeps the engine's framing, which says who sent it (the user, a
+  // plugin, a non-user source), so the resumed Claude can weigh it the same way.
   on('session.append', async ($, e, next) => {
     const stored = await next(e)
     if (e.agentId !== undefined || (e.door !== 'delivery' && e.door !== 'prompt')) return stored
@@ -290,7 +292,8 @@ async function compactAndResume($: EngineInterface, attempt: number): Promise<vo
   try {
     await $.command.run({ command: 'compact', args: COMPACT_INSTRUCTIONS })
   } catch (err) {
-    // Refused while a turn still runs: try again shortly.
+    // `/compact` waits for the session to go idle, so a refusal is unexpected:
+    // try again shortly.
     if (attempt < COMPACT_ATTEMPTS) {
       $.clock.after(COMPACT_RETRY_MS, () => void compactAndResume($, attempt + 1))
       return
