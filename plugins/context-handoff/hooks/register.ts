@@ -1,16 +1,25 @@
-import type { EngineInterface, Register, SessionMessage } from 'claude-code'
+import type { Args, EngineInterface, Register, SessionMessage } from 'claude-code'
 
 import type { HandoffPhase } from '../types'
 
 // Lifecycle: idle → nudged (in the band) → pending (Handoff written, turn
 // ending) → compacting (handoff rewound off the transcript, then summarised)
 // → resuming (Claude reads the file) → idle (file deleted).
+//
+// From the Handoff call until the note is read back, deliveries (another
+// session's message, a relay's event) are held: taken before the engine queues
+// them, so none starts or joins a turn ahead of the note. Each is handed over
+// once: on the resume prompt, on the note's Read, or in a prompt of its own
+// when the handoff ends another way or the hold runs 10 minutes. After the
+// compaction, tools other than a Read of the note are refused until it is
+// read, so whichever turn comes first (the resume, a typed prompt) reads it.
 
 const TOOL = 'Handoff'
 const TOOL_ID = 'mcp__context-handoff__Handoff'
 const MIN_CONTENT = 200
 const COMPACT_RETRY_MS = 500
 const COMPACT_ATTEMPTS = 20
+const HOLD_MAX_MS = 10 * 60_000
 
 const phaseRef = { plugin: 'context-handoff', key: 'phase' } as const
 const pathRef = { plugin: 'context-handoff', key: 'handoffPath' } as const
@@ -21,6 +30,13 @@ const countRef = { plugin: 'context-handoff', key: 'handoffCount' } as const
 const resumeTurnRef = { plugin: 'context-handoff', key: 'resumeTurnId' } as const
 const lateRef = { plugin: 'context-handoff', key: 'lateMessages' } as const
 const outcomeRef = { plugin: 'context-handoff', key: 'compactOutcome' } as const
+const heldRef = { plugin: 'context-handoff', key: 'heldMessages' } as const
+const handedRef = { plugin: 'context-handoff', key: 'heldHanded' } as const
+const noteReadRef = { plugin: 'context-handoff', key: 'isNoteRead' } as const
+const releasedRef = { plugin: 'context-handoff', key: 'isHoldReleased' } as const
+const holdRef = { plugin: 'context-handoff', key: 'holdToken' } as const
+const watchdogRef = { plugin: 'context-handoff', key: 'watchdogToken' } as const
+const foreignTurnRef = { plugin: 'context-handoff', key: 'foreignTurnId' } as const
 
 const TOOL_DESCRIPTION = [
   'Saves a note you resume from after the session compacts.',
@@ -66,17 +82,56 @@ const COMPACT_INSTRUCTIONS =
 
 const RESUME_PREFIX = 'Resuming after a context handoff.'
 
-const resumePrompt = (path: string, late: string) =>
-  `${RESUME_PREFIX} Read the note at ${path} with the Read tool. ` +
+// Whether a turn starts with the resume prompt: as submitted, or under the
+// line the engine puts ahead of a plugin's prompt ("The context-handoff plugin
+// sent a message:").
+const isResumeText = (text: string) => text.split('\n', 2).some(line => line.startsWith(RESUME_PREFIX))
+
+const resumeRules = (path: string) =>
+  `Read the note at ${path} with the Read tool. ` +
   `Before any edits, run its Verify commands and check git against its Environment section; ` +
   `where they differ, trust the repo and never revert or discard work to match the note. ` +
-  `Follow its Constraints and treat its Pending specs as binding; if a pending item is only a label with no conditions, tell the user before implementing it and do not guess. Then continue from its Next action without waiting for confirmation.` +
+  `Follow its Constraints and treat its Pending specs as binding; if a pending item is only a label with no conditions, tell the user before implementing it and do not guess.`
+
+const resumePrompt = (path: string, late: string) =>
+  `${RESUME_PREFIX} ${resumeRules(path)} Then continue from its Next action without waiting for confirmation.` +
   (late === '' ? '' :
     `\n\nThese messages arrived after the note was written, so it does not cover them. ` +
-    `Tools were blocked once the note was saved, so none was acted on and no reply was sent. ` +
+    `None was acted on and no reply was sent. ` +
     `Handle them first if they change the plan, and send any reply they ask for:\n${late}`)
 
+// What a turn that runs before the resume prompt (a typed prompt, a task's
+// notice) reads when it reaches for a tool while the note is unread.
+const gateNote = (path: string) =>
+  `This session was just compacted for a context handoff, and tools other than reading its note ` +
+  `are refused until it is read. ${resumeRules(path)} ` +
+  `Then handle the request in hand; the note's Next action comes after it.`
+
+// A held message: who it is from, outside the quote, then every line of its
+// text quoted, so no sender can write a line that reads as the label.
+const heldEntry = (from: string, text: string) => `From ${from}:\n> ${text.replace(/\r?\n/g, '\n> ')}`
+
+const heldNotice = (entry: string) =>
+  `context-handoff is holding this message until the handoff note is read:\n${entry}`
+
+const heldOnRead = (entries: readonly string[]) =>
+  `[context-handoff] These messages arrived after the handoff note was written and were held until you read it. ` +
+  `None was acted on and no reply was sent. Handle them if they change the plan, and send any reply they ask for:\n` +
+  entries.join('\n\n')
+
+const heldPrompt = (entries: readonly string[]) =>
+  `These messages arrived while a context handoff was under way and were held, so none was acted on and no reply was sent. ` +
+  `Handle them now, and send any reply they ask for:\n${entries.join('\n\n')}`
+
+const STATUS: Partial<Record<HandoffPhase, string>> = {
+  pending: 'handoff: saved · compacting when this turn ends',
+  compacting: 'handoff: compacting',
+  resuming: 'handoff: resuming',
+}
+
 type Band = { low: number; high: number; overshoot: number }
+
+type ReceiveOrigin = Args<'session.receive'>['origin']
 
 const num = (v: unknown, fallback: number) =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback
@@ -160,10 +215,19 @@ export const register: Register = (on, options) => {
     const path = `${await handoffDir($)}/handoff-${count + 1}.md`
     await $.fs.write(path, content)
     await $.state.set(pathRef, path)
-    // Each handoff's late window starts at its own call, even after an abort.
+    // Each handoff's late window and hold start at its own call, even after an abort.
     await $.state.set(lateRef, '')
     await $.state.set(outcomeRef, '')
+    await $.state.set(heldRef, [])
+    await $.state.set(handedRef, 0)
+    await $.state.set(noteReadRef, false)
+    await $.state.set(releasedRef, false)
+    await $.state.set(foreignTurnRef, '')
+    const hold = `${path}@${await $.clock.now()}`
+    await $.state.set(holdRef, hold)
     await $.state.set(phaseRef, 'pending')
+    $.clock.after(HOLD_MAX_MS, () => void releaseHold($, hold).catch(err =>
+      $.ui.log(`context-handoff: the 10-minute release failed: ${String(err)}`)))
     $.ui.status('handoff: saved · compacting when this turn ends')
     return {
       result: `Handoff saved to ${path}. End your turn now: one line, no further tool calls. ` +
@@ -171,21 +235,30 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // Every other tool: hold the turn once the handoff is written, delete the
-  // file once it has been read back, and tell Claude when it is in the band.
+  // Every other tool: hold the turn once the handoff is written; after the
+  // compaction, refuse all but a Read of the note until it is read, and hand
+  // over on that Read what was held; delete the file once it has been read
+  // back; and tell Claude when it is in the band.
   on('tool.call', async ($, e, next) => {
     if (e.agentId !== undefined || e.tool === TOOL_ID) return next(e)
     const phase = await phaseOf($)
     if (phase === 'pending') {
       return { deny: 'The handoff is saved; end your turn now with no further tool calls.' }
     }
+    const isAfter = await isCompacted($, phase)
+    const isNote = isAfter && e.tool === 'Read' && (await noteOf($, e.file_path)) !== undefined
+    const gated = isAfter && !isNote ? await gatedPath($) : undefined
+    if (gated !== undefined) return { deny: gateNote(gated) }
     const ran = await next(e)
     if (ran.deny !== undefined) return ran
-    if (phase === 'resuming' && e.tool === 'Read' && ran.isError !== true) {
-      await cleanup($, e.file_path)
+    const context = [...(ran.context ?? [])]
+    if (isNote && e.tool === 'Read' && ran.isError !== true) {
+      const held = await noteRead($, e.file_path)
+      if (held !== undefined) context.push(held)
     }
     const note = await bandNote($, band)
-    return note === undefined ? ran : { ...ran, context: [...(ran.context ?? []), note] }
+    if (note !== undefined) context.push(note)
+    return context.length === (ran.context ?? []).length ? ran : { ...ran, context }
   })
 
   // A turn with no tool calls still hears about the band, with the prompt.
@@ -196,10 +269,14 @@ export const register: Register = (on, options) => {
   })
 
   // Marks which turn is the resume turn, so another turn ending first (a
-  // message from another session, say) is not taken for it.
+  // message from another session, say) is not taken for it. Any other turn
+  // that starts after the compaction is marked too: a note read there stays
+  // for the resume turn, which reads it again.
   on('turn.start', async ($, e, next) => {
-    if ((await phaseOf($)) === 'resuming' && e.text.startsWith(RESUME_PREFIX)) {
-      await $.state.set(resumeTurnRef, e.turnId)
+    const phase = await phaseOf($)
+    if (await isCompacted($, phase)) {
+      if (phase === 'resuming' && isResumeText(e.text)) await $.state.set(resumeTurnRef, e.turnId)
+      else await $.state.set(foreignTurnRef, e.turnId)
     }
     return next(e)
   })
@@ -214,6 +291,7 @@ export const register: Register = (on, options) => {
         const path = (await $.state.get(pathRef)).value
         await $.state.set(phaseRef, 'nudged')
         await $.state.set(pathRef, '')
+        await flushHeld($)
         $.ui.toast(`Handoff cancelled by the interrupt; the note stays at ${path}.`)
         return answered
       }
@@ -222,11 +300,19 @@ export const register: Register = (on, options) => {
       return answered
     }
 
+    if ((await $.state.get(foreignTurnRef)).value === e.turnId) await $.state.set(foreignTurnRef, '')
+
     if (phase === 'resuming') {
       // Only the resume turn's end counts; any other turn ends and waits.
       if ((await $.state.get(resumeTurnRef)).value !== e.turnId) return answered
-      // The resume turn ended without a successful Read of the note: keep it.
       const path = (await $.state.get(pathRef)).value
+      // Read back in a turn before this one and kept for it: the handoff is done.
+      if ((await $.state.get(noteReadRef)).value === true && path) {
+        await cleanup($, path)
+        if ((await phaseOf($)) !== 'idle') await finish($, true)
+        return answered
+      }
+      // The resume turn ended without a successful Read of the note: keep it.
       await finish($, false)
       if (path) $.ui.toast(`Resumed, but the handoff was not read back; kept at ${path}.`)
       return answered
@@ -245,11 +331,31 @@ export const register: Register = (on, options) => {
     return answered
   })
 
-  // A message that reaches Claude after the Handoff call (another session, a
-  // teammate, a task) is drained into the handoff turn as a delivery row, which
-  // the rewind cuts off. Quote it for the resume prompt; the row is kept as is.
-  // The quote keeps the engine's framing, which says who sent it (the user, a
-  // plugin, a non-user source), so the resumed Claude can weigh it the same way.
+  // The hold: a delivery to the main conversation (another session's message,
+  // a relay's event, a Remote Control prompt) is taken before the engine
+  // queues it, so it neither starts a turn ahead of the note nor joins one. A
+  // notice row keeps its text in the transcript; the model never reads that.
+  on('session.receive', async ($, e, next) => {
+    if (e.agentId !== undefined || !(await isHolding($))) return next(e)
+    const text = e.text.trim()
+    if (text === '') return { consumed: 'context-handoff: an empty delivery during a handoff' }
+    const entry = heldEntry(senderOf(e.origin), text)
+    const held = await $.state.get(heldRef)
+    const isSet = (await $.state.set(heldRef, [...(held.value ?? []), entry], { ifVersion: held.version })).isSet
+    // Another write to the list came first: deliver this one as usual rather than risk losing it.
+    if (!isSet) return next(e)
+    await $.session.append({ message: { type: 'system', content: [{ type: 'text', text: heldNotice(entry) }] } })
+      .catch(err => $.ui.log(`context-handoff: could not record a held message: ${String(err)}`))
+    await showStatus($)
+    return { consumed: 'held until the context handoff note is read' }
+  })
+
+  // A message that reaches Claude after the Handoff call without passing the
+  // hold (a prompt typed mid-turn, a task's notice) is drained into the handoff
+  // turn as a delivery row, which the rewind cuts off. Quote it for the resume
+  // prompt; the row is kept as is. The quote keeps the engine's framing, which
+  // says who sent it (the user, a plugin, a non-user source), so the resumed
+  // Claude can weigh it the same way.
   on('session.append', async ($, e, next) => {
     const stored = await next(e)
     if (e.agentId !== undefined || (e.door !== 'delivery' && e.door !== 'prompt')) return stored
@@ -285,10 +391,21 @@ export const register: Register = (on, options) => {
   })
 }
 
+// Any failure past the Handoff call ends the handoff, since a phase left
+// behind would keep holding deliveries and refusing tools.
 async function compactAndResume($: EngineInterface, attempt: number): Promise<void> {
+  try {
+    await compactThenResume($, attempt)
+  } catch (err) {
+    $.ui.log(`context-handoff: the compaction or resume failed: ${String(err)}`)
+    await finish($, false).catch(() => undefined)
+  }
+}
+
+async function compactThenResume($: EngineInterface, attempt: number): Promise<void> {
   const path = (await $.state.get(pathRef)).value
   if (!path) return finish($, false)
-  $.ui.status('handoff: compacting')
+  await showStatus($)
   try {
     await $.command.run({ command: 'compact', args: COMPACT_INSTRUCTIONS })
   } catch (err) {
@@ -308,31 +425,79 @@ async function compactAndResume($: EngineInterface, attempt: number): Promise<vo
     $.ui.toast(`Handoff: compaction ${outcome === '' ? 'did not run' : outcome}; the note stays at ${path}.`)
     return finish($, false)
   }
-  $.ui.status('handoff: resuming')
   const late = (await $.state.get(lateRef)).value ?? ''
-  await $.prompt.submit({ text: resumePrompt(path, late) })
+  // What was held so far rides on the prompt; what comes later, on the note's Read.
+  const handed = (await $.state.get(handedRef)).value ?? 0
+  const held = await takeHeld($)
+  await showStatus($)
+  try {
+    const r = await $.prompt.submit({ text: resumePrompt(path, [late, ...held].filter(s => s !== '').join('\n\n')) })
+    if (r.drop === undefined) return
+    $.ui.toast(`Handoff: the resume prompt was refused (${r.drop}); the note stays at ${path}.`)
+  } catch (err) {
+    $.ui.toast(`Handoff: the resume prompt failed (${String(err)}); the note stays at ${path}.`)
+  }
+  // Never delivered: give its held messages back for the flush.
+  await $.state.set(handedRef, handed)
+  return finish($, false)
+}
+
+// The 10-minute backstop: a hang the plugin cannot see must not hold
+// deliveries for good. What is held goes out and holding stops; the handoff
+// itself carries on.
+async function releaseHold($: EngineInterface, hold: string): Promise<void> {
+  // A timer's `$` sees other hooks' writes only after one of its own.
+  await $.state.set(watchdogRef, hold)
+  if ((await $.state.get(holdRef)).value !== hold || !(await isHolding($))) return
+  await $.state.set(releasedRef, true)
+  await flushHeld($)
+  await showStatus($)
+  const path = (await $.state.get(pathRef)).value
+  $.ui.toast(`Handoff: messages held for 10 minutes are released; the note is at ${path}.`)
+}
+
+// The note was read back after the compaction: the hold and the gate end, and
+// what was held since the resume prompt was built rides on this Read. A turn
+// that came before the resume (a typed prompt) leaves the note for the resume
+// turn, which reads it again; otherwise it is deleted.
+async function noteRead($: EngineInterface, readPath: string): Promise<string | undefined> {
+  await $.state.set(noteReadRef, true)
+  const held = await takeHeld($)
+  if (((await $.state.get(foreignTurnRef)).value ?? '') !== '') {
+    $.ui.status('handoff: note read · resume prompt next')
+  } else {
+    await cleanup($, readPath)
+  }
+  return held.length === 0 ? undefined : heldOnRead(held)
+}
+
+// The note's real path and kind, when `readPath` resolves to the very file
+// this plugin wrote; undefined otherwise.
+async function noteOf($: EngineInterface, readPath: string): Promise<{ real: string; isFile: boolean } | undefined> {
+  const path = (await $.state.get(pathRef)).value
+  if (!path) return undefined
+  const [file, read] = await Promise.all([
+    $.fs.stat(path, { resolve: true }).catch(() => undefined),
+    $.fs.stat(readPath, { resolve: true }).catch(() => undefined),
+  ])
+  const real = file?.realPath
+  return real !== undefined && read?.realPath === real ? { real, isFile: file?.kind === 'file' } : undefined
 }
 
 // Deletes the note only when the Read was of exactly the file this plugin
 // wrote, and that file lies under this session's handoff folder.
 async function cleanup($: EngineInterface, readPath: string): Promise<void> {
-  const path = (await $.state.get(pathRef)).value
-  if (!path) return
+  const note = await noteOf($, readPath)
+  if (note === undefined) return
   const dir = await handoffDir($)
-  const [file, read, root] = await Promise.all([
-    $.fs.stat(path, { resolve: true }).catch(() => undefined),
-    $.fs.stat(readPath, { resolve: true }).catch(() => undefined),
-    $.fs.stat(dir, { resolve: true }).catch(() => undefined),
-  ])
-  const real = file?.realPath
-  if (real === undefined || read?.realPath !== real) return
-  if (file?.kind !== 'file' || root?.realPath === undefined || !real.startsWith(`${root.realPath}/`)) {
-    $.ui.log(`context-handoff: refused to delete ${real}: not a file under ${dir}`)
+  const root = await $.fs.stat(dir, { resolve: true }).catch(() => undefined)
+  if (!note.isFile || root?.realPath === undefined || !note.real.startsWith(`${root.realPath}/`)) {
+    $.ui.log(`context-handoff: refused to delete ${note.real}: not a file under ${dir}`)
     return
   }
-  const removed = await $.process.run(['rm', '--', real])
+  const removed = await $.process.run(['rm', '--', note.real])
   if (removed.exitCode !== 0) {
-    $.ui.log(`context-handoff: could not delete ${real}: ${removed.stderr.trim()}`)
+    $.ui.log(`context-handoff: could not delete ${note.real}: ${removed.stderr.trim()}`)
     return
   }
   // Leaves the folder alone when another handoff of this session is in it.
@@ -345,14 +510,90 @@ async function finish($: EngineInterface, isDone: boolean): Promise<void> {
     const count = (await $.state.get(countRef)).value ?? 0
     await $.state.set(countRef, count + 1)
   }
+  // Closes the hold and the gate first, then hands over what is still held.
   await $.state.set(phaseRef, 'idle')
+  await flushHeld($)
   await $.state.set(pathRef, '')
   await $.state.set(firmRef, false)
   await $.state.set(overshootRef, false)
   await $.state.set(lateRef, '')
   await $.state.set(outcomeRef, '')
   await $.state.set(resumeTurnRef, '')
+  await $.state.set(heldRef, [])
+  await $.state.set(handedRef, 0)
+  await $.state.set(noteReadRef, false)
+  await $.state.set(releasedRef, false)
+  await $.state.set(foreignTurnRef, '')
+  await $.state.set(holdRef, '')
   $.ui.status(undefined)
+}
+
+// Whether deliveries are held: from the Handoff call until the note is read
+// back, unless the 10-minute release came first.
+async function isHolding($: EngineInterface): Promise<boolean> {
+  const phase = await phaseOf($)
+  if (phase !== 'pending' && phase !== 'compacting' && phase !== 'resuming') return false
+  return (await $.state.get(releasedRef)).value !== true && (await $.state.get(noteReadRef)).value !== true
+}
+
+// Whether the compaction of this handoff has finished: the resume is under
+// way, or `/compact` is back and its result has yet to reach compactAndResume.
+async function isCompacted($: EngineInterface, phase: HandoffPhase): Promise<boolean> {
+  if (phase === 'resuming') return true
+  return phase === 'compacting' && (await $.state.get(outcomeRef)).value === 'compacted'
+}
+
+// The note's path while tools are refused: after the compaction, until the
+// note is read or the hold is released.
+async function gatedPath($: EngineInterface): Promise<string | undefined> {
+  if (!(await isHolding($))) return undefined
+  return (await $.state.get(pathRef)).value || undefined
+}
+
+// The held messages not yet handed over, marked handed now.
+async function takeHeld($: EngineInterface): Promise<string[]> {
+  const held = (await $.state.get(heldRef)).value ?? []
+  const handed = (await $.state.get(handedRef)).value ?? 0
+  if (held.length <= handed) return []
+  await $.state.set(handedRef, held.length)
+  return held.slice(handed)
+}
+
+// Sends what is held and not yet handed over as one prompt, so a handoff that
+// ends without the note being read back loses none of it.
+async function flushHeld($: EngineInterface): Promise<void> {
+  const held = await takeHeld($)
+  if (held.length === 0) return
+  void $.prompt.submit({ text: heldPrompt(held) }).then(
+    r => { if (r.drop !== undefined) $.ui.log(`context-handoff: held messages were refused (${r.drop}); their notices are in the transcript`) },
+    err => $.ui.log(`context-handoff: could not send the held messages (${String(err)}); their notices are in the transcript`),
+  )
+}
+
+// The status line for the phase, with how many messages are held.
+async function showStatus($: EngineInterface): Promise<void> {
+  const base = STATUS[await phaseOf($)]
+  if (base === undefined) return
+  const held = ((await $.state.get(heldRef)).value ?? []).length - ((await $.state.get(handedRef)).value ?? 0)
+  $.ui.status(held > 0 ? `${base} · ${held} message${held === 1 ? '' : 's'} held` : base)
+}
+
+// Who a held message is from, outside its quote: a delivery's text carries no
+// engine framing, and a sender's own words never name it. A teammate's name is
+// shown only when the harness stamped it; a sender's plugin claim never is.
+function senderOf(origin: ReceiveOrigin): string {
+  if ('teammate' in origin) return origin.isVerified ? `teammate ${origin.teammate}` : 'a teammate (unverified)'
+  switch (origin.kind) {
+    case 'peer': return 'another Claude session'
+    case 'coordinator': return 'the coordinating session'
+    case 'peer-send-message': return 'another session'
+    case 'projects-relay': return 'a coordinating session'
+    case 'bridge': return 'the user, via Remote Control'
+    case 'slack-ping': return 'the user, via Slack'
+    case 'task-notification': return 'a relay event'
+    case 'scheduled-trigger': return 'a scheduled task'
+    default: return `an ${origin.kind} delivery`
+  }
 }
 
 // The note for Claude when the context is in the band, at most once per

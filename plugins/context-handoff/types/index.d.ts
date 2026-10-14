@@ -12,6 +12,13 @@ declare module 'claude-code' {
       resumeTurnId: string
       lateMessages: string
       compactOutcome: string
+      heldMessages: string[]
+      heldHanded: number
+      isNoteRead: boolean
+      isHoldReleased: boolean
+      holdToken: string
+      watchdogToken: string
+      foreignTurnId: string
     }
   }
 }

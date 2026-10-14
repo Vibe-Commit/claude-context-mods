@@ -44,14 +44,15 @@ claude plugin uninstall context-handoff@claude-context-mods
 
 1. **In the band.** Once context passes 60%, Claude gets a hidden note telling it to hand off at the next natural boundary: a task finished, tests green, or before a new subtask, never mid-edit. At 70% the note says to do it now. The status line shows the current phase.
 2. **Write.** Claude calls the mod's `Handoff` tool with a markdown note. The note has fixed sections: goal, the user's constraints, status (verified or not, with proof), the next action, failed approaches, decisions and their reasons, open issues, git and environment state, and commands to verify. It is saved to `~/.claude/handoffs/<session-id>/handoff-N.md`. Claude is then held to ending its turn.
-3. **Rewind and compact.** When the turn ends, the mod compacts the session. The mod runs `/compact` for this, and the summary only covers the transcript up to the `Handoff` call, so writing the note never ends up in context. A message that arrives just as Claude ends the handoff turn may be answered first; that turn stays in the summary.
-4. **Resume.** The mod sends a prompt telling Claude to read the note, run its verify commands, and check git state against it before any edits, trusting the repo where they differ. Claude then keeps to the note's constraints and continues from its next action. Messages that reach Claude after the note is written (from you, another session or a teammate) are quoted on that prompt, since the rewind would otherwise drop them.
+3. **Rewind and compact.** When the turn ends, the mod compacts the session. The mod runs `/compact` for this, and the summary only covers the transcript up to the `Handoff` call, so writing the note never ends up in context.
+4. **Resume.** The mod sends a prompt telling Claude to read the note, run its verify commands, and check git state against it before any edits, trusting the repo where they differ. Claude then keeps to the note's constraints and continues from its next action. After the compaction, every tool except reading the note is refused until the note is read. So if something else starts the first turn (a prompt you type during `/compact`, a background task finishing), Claude still reads the note before it acts.
+   - **Messages wait for the note.** From the `Handoff` call until the note is read back, messages from other sessions, teammates, relays and Remote Control are held instead of queued, so none starts or joins a turn ahead of the note. Each held message shows as a notice row, and the status line counts them. Claude gets each one exactly once: quoted on the resume prompt, or attached to its read of the note. If the handoff ends any other way, or after 10 minutes, they are sent in one prompt of their own. A prompt you type during the handoff turn is quoted on the resume prompt.
 5. **Clean up.** After Claude reads the note back, the mod deletes it. It only deletes a file it wrote itself, and only if that file is inside the session's handoff folder. If the note is never read, it is kept and a notice shows its path.
 
 Safeguards:
 - Subagents are ignored.
 - If a turn ends at 75% or more with no handoff, Claude is asked once to write one.
-- If you interrupt the turn after the note is saved, the compaction is cancelled and the note is kept.
+- If you interrupt the turn after the note is saved, the compaction is cancelled, the note is kept, and any held messages are sent right away.
 
 Command: `/handoff [status|on|off|now]`. `now` asks for a handoff right away, which is the quickest way to try the mod.
 
